@@ -45,7 +45,7 @@ def load_tickers_from_sheet(spreadsheet_name='stock_list', sheet_name='시트1',
     # 3. Try Streamlit Secrets (JSON String) - Easier for users
     elif 'gcp_json' in st.secrets:
         try:
-            creds_dict = json.loads(st.secrets['gcp_json'])
+            creds_dict = json.loads(st.secrets['gcp_json'], strict=False)
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPES)
         except Exception as e:
             st.error(f"Secrets JSON error: {e}")
