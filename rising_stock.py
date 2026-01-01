@@ -25,24 +25,12 @@ st.set_page_config(layout="wide", page_title="Rising Stock Analysis")
 @st.cache_data(ttl=3600)
 def load_tickers_from_sheet(spreadsheet_name='stock_list', sheet_name='시트1', col_idx=1):
     creds = None
-    # 1. Try Local File
     if os.path.exists(SERVICE_ACCOUNT_FILE):
         try:
             creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
         except Exception as e:
             st.error(f"Local key error: {e}")
             return []
-    # 2. Try Streamlit Secrets (Cloud)
-    elif 'gcp_service_account' in st.secrets:
-        try:
-            # st.secrets returns a plain dict for the nested section
-            creds_dict = dict(st.secrets['gcp_service_account'])
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPES)
-        except Exception as e:
-            st.error(f"Secrets key error: {e}")
-            return []
-            
-    # 3. Try Streamlit Secrets (JSON String) - Easier for users
     elif 'gcp_json' in st.secrets:
         try:
             creds_dict = json.loads(st.secrets['gcp_json'], strict=False)
@@ -51,9 +39,7 @@ def load_tickers_from_sheet(spreadsheet_name='stock_list', sheet_name='시트1',
             st.error(f"Secrets JSON error: {e}")
             return []
 
-    if not creds:
-        st.error("Authentication credentials not found (JSON or Secrets).")
-        return []
+    if not creds: return []
 
     try:
         client = gspread.authorize(creds)
@@ -140,29 +126,34 @@ def analyze_stage1(market_data, tickers):
     for symbol in valid_tickers:
         try:
             c_series = close[symbol].dropna()
-            if len(c_series) < 60: continue
+            if len(c_series) < 20: continue 
             
-            h60 = high[symbol].dropna().tail(60).max()
-            l60 = low[symbol].dropna().tail(60).min()
-            volatility = (h60 - l60) / h60
+            lookback = min(60, len(c_series))
+            
+            h60 = high[symbol].dropna().tail(lookback).max()
+            l60 = low[symbol].dropna().tail(lookback).min()
+            volatility = (h60 - l60) / h60 if h60 != 0 else 0
             curr_price = c_series.iloc[-1]
-            is_vcp = volatility < 0.20 and (curr_price > h60 * 0.85)
+            markdown = (h60 - curr_price) / h60 if h60 != 0 else 0
             
             v_series = volume[symbol].dropna()
             curr_vol = v_series.iloc[-1]
             vol_20_avg = v_series.tail(20).mean()
-            is_vol_spike = curr_vol > (vol_20_avg * 1.03)
+            vol_ratio = (curr_vol / vol_20_avg) if vol_20_avg > 0 else 0
+            is_vol_spike = vol_ratio > 1.03
             
-            if is_vcp:
-                candidates.append({'Ticker': symbol,'VCP': True,'Vol_Spike': is_vol_spike,'Price': curr_price})
+            candidates.append({
+                'Ticker': symbol,
+                'Volatility': volatility,
+                'Markdown': markdown,
+                'Vol_Ratio': vol_ratio,
+                'Vol_Spike': is_vol_spike, 
+                'Price': curr_price
+            })
         except: continue
     return pd.DataFrame(candidates)
 
 def get_stock_info_data(tickers):
-    """
-    Manages stockinfo.pkl.
-    Fields: Name, Sector, Inst_Own, Turnaround, NewsList (List of dicts), Metrics...
-    """
     cached_df = pd.DataFrame()
     if os.path.exists(STOCK_INFO_FILE):
         try:
@@ -173,7 +164,6 @@ def get_stock_info_data(tickers):
     current_time = datetime.now()
     one_week_ago = current_time - timedelta(days=7)
     
-    # Init Cache Columns if new schema
     if not cached_df.empty and 'LastUpdated' not in cached_df.columns:
         cached_df['LastUpdated'] = datetime.now() - timedelta(days=365)
     
@@ -186,18 +176,15 @@ def get_stock_info_data(tickers):
         existing_tickers = cached_df['Ticker'].unique().tolist()
         missing = list(set(tickers) - set(existing_tickers))
         
-        # Check expired
         if 'LastUpdated' in cached_df.columns:
              cached_df['LastUpdated'] = pd.to_datetime(cached_df['LastUpdated'])
              expired_rows = cached_df[cached_df['LastUpdated'] < one_week_ago]
              expired = expired_rows['Ticker'].tolist()
-        else:
-             expired = []
+        else: expired = []
 
-        # Check for missing Schema Columns (e.g. Name, News_List)
         missing_schema = []
         if 'Name' not in cached_df.columns or 'RecMean' not in cached_df.columns:
-             missing_schema = existing_tickers # Update all if schema changed
+             missing_schema = existing_tickers
 
         tickers_to_update = list(set(missing + expired + missing_schema))
         tickers_to_update = [t for t in tickers_to_update if t in tickers]
@@ -212,7 +199,6 @@ def get_stock_info_data(tickers):
                 stock = yf.Ticker(symbol)
                 info = stock.info
                 
-                # Turnaround
                 financials = stock.quarterly_financials
                 turnaround_status = "N/A"
                 if not financials.empty and 'Net Income' in financials.index:
@@ -224,7 +210,6 @@ def get_stock_info_data(tickers):
                         elif rec <= 0 and prev <= 0: turnaround_status = "Deficit Reduction" if rec > prev else "Deficit (Worsening)"
                         else: turnaround_status = "Turn to Red"
                 
-                # News
                 news_list = stock.news
                 news_items = []
                 pos_keys = ['launch', 'growth', 'approve', 'contract', 'partnership', 'record']
@@ -235,7 +220,6 @@ def get_stock_info_data(tickers):
                         if pub and (current_time - datetime.fromtimestamp(pub)).total_seconds() > 48*3600: continue
                         title = n.get('content', {}).get('title', n.get('title', ''))
                         link = n.get('content', {}).get('clickThroughUrl', {}).get('url', n.get('link', ''))
-                        
                         is_good = any(k in title.lower() for k in pos_keys)
                         news_items.append({'title': title, 'link': link, 'good': is_good})
                 
@@ -269,13 +253,9 @@ def get_stock_info_data(tickers):
         
         if results:
             new_data_df = pd.DataFrame(results)
-            # Remove old rows for updated tickers
             cached_df = cached_df[~cached_df['Ticker'].isin(new_data_df['Ticker'])]
-            # Concat
             cached_df = pd.concat([cached_df, new_data_df], ignore_index=True)
-            
-            with open(STOCK_INFO_FILE, 'wb') as f:
-                pickle.dump(cached_df, f)
+            with open(STOCK_INFO_FILE, 'wb') as f: pickle.dump(cached_df, f)
         
         status_text.empty()
         
@@ -298,8 +278,22 @@ with st.expander("Configuration & Data Update", expanded=False):
                     st.session_state['tickers'] = tickers
                     mk_data = update_market_data(tickers)
                     st.session_state['market_data'] = mk_data
-                    st.success(f"Market Data Updated ({len(tickers)}).")
+                    st.success(f"Market Data Updated ({len(tickers)} tickers loaded).")
                     if 'selected_tickers' in st.session_state: del st.session_state['selected_tickers']
+                    
+# --- Metric Definitions ---
+with st.expander("📚 Metric Definitions & Logic", expanded=False):
+    st.markdown("""
+    **Inst. Support (기관 수급 포착):**
+    - `Inst Own` 및 `Vol Ratio` 조건을 만족하는지 판단합니다 (체크박스용).
+    - 기관 보유 40% 이상, 거래량 50% 이상 (0.5배) 조건을 기본으로 합니다.
+
+    **Filters (범위 설정 가능):**
+    - `60D Volatility`: 변동성 (낮을수록 안정적)
+    - `Markdown`: 고점 대비 하락폭
+    - `Inst Own %`: 기관 보유 비중
+    - `Vol Spike Ratio`: 거래량 급증 비율 (0.5 = 평소의 반, 2.0 = 평소의 2배)
+    """)
 
 if 'market_data' not in st.session_state and os.path.exists(DAILY_DATA_FILE):
     try:
@@ -319,20 +313,32 @@ if 'market_data' in st.session_state and not st.session_state['market_data'].emp
         info_df = get_stock_info_data(candidate_tickers)
         
         if not info_df.empty:
-            final_df = pd.merge(stage1_df, info_df, on='Ticker', how='inner')
+            final_df = pd.merge(stage1_df, info_df, on='Ticker', how='left')
         else:
             final_df = stage1_df
             for col in ['Name', 'Sector','Inst_Own','Turnaround','Good_News','PER','PBR','PSR','EV/EBITDA','RevGrowth','EPSGrowth','DivYield','RecKey','RecMean', 'News_List']:
                 final_df[col] = None
         
-        # Fallback for Name if merger missed it (partial update scenario)
         if 'Name' not in final_df.columns: final_df['Name'] = final_df['Ticker']
-
-        final_df['Inst_Support'] = (final_df['Inst_Own'] > 0.4) & final_df['Vol_Spike']
+        
+        final_df['Inst_Support'] = (final_df['Inst_Own'] >= 0.4) & (final_df['Vol_Ratio'] >= 0.5)
         
         # --- Filters ---
         st.subheader("Filter Candidates")
         
+        # Bidirectional Sliders (Range)
+        col_v1, col_v2, col_v3, col_v4 = st.columns(4)
+        with col_v1:
+             f_vol = st.slider("60D Volatility Range", 0.0, 1.0, (0.0, 0.20), step=0.01)
+        with col_v2:
+             f_markdown = st.slider("Markdown Range", 0.0, 1.0, (0.0, 0.15), step=0.01)
+        with col_v3:
+             # Default 0.4 to 1.0
+             f_inst_own = st.slider("Inst Own % Range", 0.0, 1.0, (0.40, 1.0), step=0.01)
+        with col_v4:
+             # Default 1.03 to 10.0
+             f_vol_ratio = st.slider("Vol Spike Ratio Range", 0.0, 10.0, (1.03, 10.0), step=0.1)
+
         def get_range(col):
              if col not in final_df.columns: return 0.0, 100.0
              vals = final_df[col].dropna()
@@ -351,46 +357,64 @@ if 'market_data' in st.session_state and not st.session_state['market_data'].emp
         with fc4: f_eg = st.slider("EPS Growth", min_value=min(-1.0, min_eg), max_value=max(5.0, max_eg), value=(min(-1.0, min_eg), max(5.0, max_eg)))
         
         c1, c2, c3 = st.columns(3)
-        with c1: selected_sectors = st.multiselect("Sector", options=sorted(final_df['Sector'].astype(str).unique()), default=[])
-        with c2: selected_turnaround = st.multiselect("Turnaround", options=sorted(final_df['Turnaround'].astype(str).unique()), default=[])
+        with c1: selected_sectors = st.multiselect("Sector", options=sorted(final_df['Sector'].fillna("Unknown").astype(str).unique()), default=[])
+        with c2: selected_turnaround = st.multiselect("Turnaround", options=sorted(final_df['Turnaround'].fillna("N/A").astype(str).unique()), default=[])
         with c3: support_only = st.checkbox("Inst. Support Only", value=False)
         
         view = final_df.copy()
+        
+        # Apply Logic Filters (Range)
+        view = view[
+            (view['Volatility'] >= f_vol[0]) & (view['Volatility'] <= f_vol[1]) &
+            (view['Markdown'] >= f_markdown[0]) & (view['Markdown'] <= f_markdown[1]) &
+            (view['Inst_Own'].fillna(0) >= f_inst_own[0]) & (view['Inst_Own'].fillna(0) <= f_inst_own[1]) &
+            (view['Vol_Ratio'].fillna(0) >= f_vol_ratio[0]) & (view['Vol_Ratio'].fillna(0) <= f_vol_ratio[1])
+        ]
+        
         if selected_sectors: view = view[view['Sector'].isin(selected_sectors)]
         if selected_turnaround: view = view[view['Turnaround'].isin(selected_turnaround)]
+        
         if support_only: view = view[view['Inst_Support']]
         
-        # Numeric Filter
         if 'PER' in view.columns:
             view = view[
                 (view['PER'].fillna(0) >= f_pe[0]) & (view['PER'].fillna(0) <= f_pe[1]) &
                 (view['PBR'].fillna(0) >= f_pbr[0]) & (view['PBR'].fillna(0) <= f_pbr[1]) &
-                (view['RevGrowth'].fillna(-999) >= f_rg[0]) & (view['RevGrowth'].fillna(-999) <= f_rg[1]) &
+                (view['RevGrowth'].fillna(-999) >= f_rg[0]) & (view['RevGrowth'].fillna(-999) <= f_rg[1]) & 
                 (view['EPSGrowth'].fillna(-999) >= f_eg[0]) & (view['EPSGrowth'].fillna(-999) <= f_eg[1])
             ]
 
+        # --- Data Stats Summary ---
+        st.markdown(f"""
+        **Pipeline Stats:**
+        - Total Loaded: `{len(tickers)}`
+        - Valid Price Data: `{len(stage1_df)}`
+        - **Displayed:** `{len(view)}`
+        """)
+
         # --- Table ---
-        st.markdown(f"**Candidates Found:** {len(view)}")
         if 'Select' not in view.columns: view.insert(0, "Select", False)
         
-        display_cols = ['Select', 'Ticker', 'Name', 'Price', 'Sector', 'Inst_Support', 'Turnaround', 'Good_News', 
+        display_cols = ['Select', 'Ticker', 'Name', 'Price', 'Volatility', 'Markdown', 
+                        'Inst_Own', 'Vol_Ratio', 
+                        'Sector', 'Inst_Support', 'Turnaround', 
                         'PER', 'PBR', 'RevGrowth', 'EPSGrowth', 'RecMean']
         
-        # Ensure cols exist
-        for c in display_cols:
-            if c not in view.columns: view[c] = None
+        for c in display_cols: 
+             if c not in view.columns: view[c] = None
         
         edited_df = st.data_editor(
             view[display_cols].style.format({
                 "Price": "${:.2f}",
+                "Volatility": "{:.1%}", "Markdown": "{:.1%}",
+                "Inst_Own": "{:.1%}", "Vol_Ratio": "{:.2f}x",
                 "PER": "{:.1f}", "PBR": "{:.1f}",
                 "RevGrowth": "{:.1%}", "EPSGrowth": "{:.1%}",
                 "RecMean": "{:.2f}"
             }),
             column_config={
                 "Select": st.column_config.CheckboxColumn("Check", default=False),
-                "Inst_Support": st.column_config.CheckboxColumn("Inst"),
-                "Good_News": st.column_config.CheckboxColumn("News"),
+                "Inst_Support": st.column_config.CheckboxColumn("Inst Supp"),
             },
             disabled=[c for c in display_cols if c != "Select"],
             hide_index=True,
@@ -419,6 +443,8 @@ if 'market_data' in st.session_state and not st.session_state['market_data'].emp
             
             format_map = {
                 'Price': lambda x: f"${x:.2f}",
+                'Volatility': lambda x: f"{x*100:.1f}%",
+                'Markdown': lambda x: f"{x*100:.1f}%",
                 'Inst_Own': lambda x: f"{x*100:.1f}%",
                 'RevGrowth': lambda x: f"{x*100:.1f}%",
                 'EPSGrowth': lambda x: f"{x*100:.1f}%",
@@ -427,12 +453,11 @@ if 'market_data' in st.session_state and not st.session_state['market_data'].emp
                 'PSR': lambda x: f"{x:.1f}", 'EV/EBITDA': lambda x: f"{x:.1f}",
                 'RecMean': lambda x: f"{x:.2f}"
             }
-            cols_to_show = ['Name', 'Price','Sector','Inst_Own','PER','PBR','PSR','EV/EBITDA','RevGrowth','EPSGrowth','DivYield','RecKey','RecMean','Turnaround']
+            cols_to_show = ['Name', 'Price','Volatility','Markdown','Sector','Inst_Own','PER','PBR','PSR','EV/EBITDA','RevGrowth','EPSGrowth','DivYield','RecKey','RecMean','Turnaround']
             
-            # Ensure exist
             for c in cols_to_show:
                 if c not in m_view.columns: m_view[c] = None
-
+                
             for c in cols_to_show:
                 if c in format_map:
                     m_view[c] = m_view[c].apply(lambda x: format_map[c](x) if pd.notnull(x) and isinstance(x, (int, float)) else x)
