@@ -9,6 +9,7 @@ import pickle
 from datetime import datetime, timedelta
 import numpy as np
 import concurrent.futures
+import json
 
 # --- Configuration ---
 SERVICE_ACCOUNT_FILE = 'service_account.json'
@@ -41,6 +42,15 @@ def load_tickers_from_sheet(spreadsheet_name='stock_list', sheet_name='시트1',
             st.error(f"Secrets key error: {e}")
             return []
             
+    # 3. Try Streamlit Secrets (JSON String) - Easier for users
+    elif 'gcp_json' in st.secrets:
+        try:
+            creds_dict = json.loads(st.secrets['gcp_json'])
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPES)
+        except Exception as e:
+            st.error(f"Secrets JSON error: {e}")
+            return []
+
     if not creds:
         st.error("Authentication credentials not found (JSON or Secrets).")
         return []
