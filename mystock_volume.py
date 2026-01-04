@@ -1,5 +1,4 @@
 import streamlit as st
-import FinanceDataReader as fdr
 import pandas as pd
 import datetime
 import yfinance as yf
@@ -11,7 +10,7 @@ st.set_page_config(page_title="Stock Volume Analysis", layout="wide")
 st.title("📈 Stock Volume Analysis Application")
 st.markdown("""
 지정한 주식의 **최근 거래량**이 **이전 20일 평균 거래량의 150%**를 초과하는지 확인합니다.
-한국 주식(6자리 코드) 및 해외 주식(티커)을 모두 지원합니다.
+한국 주식(6자리 코드) 및 해외 주식(티커)을 모두 지원합니다. (Powered by yfinance)
 """)
 
 # Input for Tickers
@@ -22,7 +21,11 @@ ticker_input = st.text_area("종목 코드 입력 (콤마 또는 공백으로 �
 tickers = [t.strip() for t in ticker_input.replace(',', ' ').split() if t.strip()]
 
 # Filter Option
-show_only_targets = st.checkbox("조건 만족 종목만 보기 (최근 거래량 > 20일 평균의 150%)", value=True)
+col1, col2 = st.columns(2)
+with col1:
+    show_only_targets = st.checkbox("조건 만족 종목만 보기 (최근 거래량 > 20일 평균의 150%)", value=True)
+with col2:
+    use_d_minus_1 = st.checkbox("하루 전 데이터(D-1) 기준으로 분석 (데이터 부족 시 사용)", value=False)
 
 if st.button("분석 시작"):
     if not tickers:
@@ -30,72 +33,100 @@ if st.button("분석 시작"):
     else:
         st.info("데이터를 분석 중입니다...")
         
-        # Get Stock Listing for Names (KRX only)
-        @st.cache_data
-        def get_krx_listing():
-            try:
-                return fdr.StockListing('KRX')
-            except Exception as e:
-                st.warning(f"KRX 종목 목록을 가져오는데 실패했습니다 ({e}). 한국 종목명이 표시되지 않을 수 있습니다.")
-                return None
-            
-        krx = get_krx_listing()
-        
         results = []
         progress_bar = st.progress(0)
         
         today = datetime.date.today()
-        start_date = today - datetime.timedelta(days=60) 
+        # Fetch enough data to calculate 20-day moving average + potential shift
+        # 120 days buffer to be safe
+        start_date = today - datetime.timedelta(days=120) 
+        start_date_str = start_date.strftime('%Y-%m-%d')
         
         for i, raw_code in enumerate(tickers):
             try:
                 # 1. Identify and Clean Code
-                # Remove .KR suffix if 6 digits precede code (common user input issue)
-                code = raw_code
+                # Clean up input (remove .KR if present, though we will handle suffixes below)
+                code = raw_code.strip()
                 if code.endswith('.KR') and len(code) == 9 and code[:6].isdigit():
-                     code = code[:6]
+                     code = code[:6] # Convert 005930.KR -> 005930 for processing
                 
-                is_kr_stock = code.isdigit() and len(code) == 6
+                # 2. Determine Symbol to Fetch
+                # Logic: 
+                # - If pure 6-digit (e.g. 005930), try .KS first. If empty, try .KQ.
+                # - If already has .KS/.KQ, use as is.
+                # - If foreign, use as is.
                 
-                # 2. Get Name
-                name = "Unknown"
-                if is_kr_stock:
-                    if krx is not None:
-                        name_row = krx[krx['Code'] == code]
-                        name = name_row['Name'].values[0] if not name_row.empty else "Unknown"
+                is_pure_kr_digit = (code.isdigit() and len(code) == 6)
+                symbols_to_try = []
+                
+                if is_pure_kr_digit:
+                    symbols_to_try = [f"{code}.KS", f"{code}.KQ"]
                 else:
-                    # Foreign stock: Try yfinance for name
-                    try:
-                        t = yf.Ticker(code)
-                        # Accessing info might be slow, consider caching if reused often, 
-                        # but for a list of ~20 it's usually okay.
-                        # Sometimes shortName is missing, try longName or symbol.
-                        name = t.info.get('shortName', t.info.get('longName', code))
-                    except:
-                        name = code
-
-                # 3. Fetch Data
-                # KR stocks: fdr.DataReader(code) works (uses KRX/Naver)
-                # Foreign: fdr.DataReader(code) works (uses Yahoo)
-                df = fdr.DataReader(code, start_date)
+                    symbols_to_try = [code]
                 
-                if len(df) < 21:
-                    st.warning(f"{code} ({name}): 데이터가 부족합니다 ({len(df)}일). 건너뜁니다.")
+                df = pd.DataFrame()
+                final_symbol = code
+                ticker_obj = None
+                
+                for sym in symbols_to_try:
+                    t = yf.Ticker(sym)
+                    # fetch history
+                    hist = t.history(start=start_date_str, auto_adjust=False)
+                    
+                    if not hist.empty:
+                        df = hist
+                        final_symbol = sym
+                        ticker_obj = t
+                        break
+                
+                # Check Data
+                # Determine Minimum Rows needed
+                min_rows = 22 if use_d_minus_1 else 21
+                
+                if df.empty or len(df) < min_rows:
+                    st.warning(f"{code}: 데이터가 부족하거나 찾을 수 없습니다 ({len(df)}일 / 필요: {min_rows}일). 건너뜁니다.")
                     continue
                 
-                curr_data = df.iloc[-1]
-                prev_20_data = df.iloc[-21:-1]
-                prev_3_data = df.iloc[-4:-1]
+                # 3. Get Name (from yfinance info)
+                name = code
+                try:
+                    info = ticker_obj.info
+                    # Prefer shortName, then longName
+                    name = info.get('shortName', info.get('longName', code))
+                except:
+                    pass
+
+                # 4. Logic Slicing
+                # yfinance history index is DatetimeIndex usually timezone-aware
+                
+                if use_d_minus_1:
+                    curr_data = df.iloc[-2]
+                    prev_20_data = df.iloc[-22:-2]
+                    prev_3_data = df.iloc[-5:-2]
+                else:
+                    curr_data = df.iloc[-1]
+                    prev_20_data = df.iloc[-21:-1]
+                    prev_3_data = df.iloc[-4:-1]
                 
                 curr_vol = curr_data['Volume']
                 curr_price = curr_data['Close']
                 
-                # Price Change Calculation
-                if 'Change' in df.columns:
-                    price_change = curr_data['Change'] * 100 
+                # Handle timezone aware timestamps for display
+                if hasattr(curr_data.name, 'date'):
+                     curr_date = curr_data.name.date()
                 else:
-                    prev_close = df.iloc[-2]['Close']
+                     curr_date = str(curr_data.name).split()[0]
+                
+                # Price Change Calculation
+                # yfinance doesn't explicitly give 'Change' in history, need to calculate
+                # D-0: prev is -2, D-1: prev is -3
+                prev_idx_offset = -3 if use_d_minus_1 else -2
+                prev_close = df.iloc[prev_idx_offset]['Close']
+                
+                if prev_close > 0:
                     price_change = ((curr_price - prev_close) / prev_close) * 100
+                else:
+                    price_change = 0.0
                     
                 avg_vol_20 = prev_20_data['Volume'].mean()
                 avg_vol_3 = prev_3_data['Volume'].mean()
@@ -105,10 +136,15 @@ if st.button("분석 시작"):
                 
                 is_target = ratio_20 > 150
                 
+                # Formatting: Integer for KR, Float for others
+                # Heuristic: If symbol ends with .KS or .KQ, treat as KR (Integer)
+                is_kr_format = final_symbol.endswith('.KS') or final_symbol.endswith('.KQ')
+                
                 results.append({
-                    'Ticker': code,
+                    'Ticker': final_symbol, # Show the resolved symbol (e.g. 005490.KS)
                     'Name': name,
-                    '현재주가': f"{curr_price:,.2f}" if not is_kr_stock else f"{curr_price:,.0f}", # Floating point for US/HK
+                    'Date': curr_date,
+                    '현재주가': f"{curr_price:,.0f}" if is_kr_format else f"{curr_price:,.2f}", 
                     '상승률': f"{price_change:+.2f}%",
                     '최근 1일 거래량': f"{curr_vol:,.0f}",
                     '3일 평균 거래량': f"{avg_vol_3:,.0f}",
@@ -138,6 +174,6 @@ if st.button("분석 시작"):
             final_df = display_df.drop(columns=['Condition', 'Raw_Ratio_20'])
             
             st.success(f"분석 완료! 총 {len(res_df)}개 중 {len(display_df)}개 종목이 표시됩니다.")
-            st.dataframe(final_df, use_container_width=True)
+            st.dataframe(final_df)
         else:
             st.warning("결과가 없습니다.")
