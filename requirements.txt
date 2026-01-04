@@ -7,4 +7,3 @@ oauth2client
 numpy
 seaborn
 matplotlib
-FinanceDataReader
